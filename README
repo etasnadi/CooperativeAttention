@@ -5,7 +5,7 @@ This code is an independent implementation of the forward pass of the FlashAtten
 
 It currently supports float16 and float32 datatypes with mixed precision: input type is always float16 while intermediate computation and matrix  accumulation precision can be either float16 or float32 (and any combination of them).
 
-Python ctypes interface is also provided (src/frontend.py). Accuracy should be tested using the python interface as it directly compares the results  PyTorch's SDPA implementation (that can utilize the GPU). 
+Python ctypes interface is also provided (src/frontend.py). Accuracy should be tested using the python interface as it directly compares the results to PyTorch's SDPA implementation (that can utilize the GPU). 
 
 CPU implementation is also provided (it uses std::float16_t that is introduced in C++23 hence you need a compiler that supports it).
 
@@ -41,6 +41,5 @@ Copyright notice:
 -----------------
 (1) Some (non-significant) part of the code is built on code from jbolznv's cooperative matrix sample (https://github.com/jeffbolznv/vk_cooperative_matrix_perf), mainly (vulkan initialization and global memory load in glsl), therefore I decided to keep the license of their code.
 (2) Vulkan is a registered trademark of the Khronos Group, and this project is not officially endorsed by them.
-(3) Tenso Core is 
 
 [1] https://arxiv.org/abs/2307.08691
