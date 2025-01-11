@@ -1,0 +1,955 @@
+/*
+SPDX-FileCopyrightText: 2025 Ervin Tasnadi <etasnadi@protonmail.com>
+SPDX-FileCopyrightText: Copyright (c) 2019-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: MIT
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+*/
+
+#version 450 core
+#pragma use_vulkan_memory_model
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_debug_printf : enable
+// Problem parameters
+layout(constant_id = 0) const uint inputSize = 1;
+layout(constant_id = 1) const uint strideInputB = 1;
+layout(constant_id = 2) const uint strideInputH = 1;
+layout(constant_id = 3) const uint strideInputS = 1;
+layout(constant_id = 4) const uint strideInputD = 1;
+// Cooperative matrix subproblem parameters
+layout(constant_id = 5) const uint lM = 1;
+layout(constant_id = 6) const uint lN = 1;
+layout(constant_id = 7) const uint lK = 1;
+// Number of cooperative matrices building up warptiles
+layout(constant_id = 8) const uint Vr = 1;
+layout(constant_id = 9) const uint Vc = 1;
+// Number of warptiles building up blocktiles
+layout(constant_id = 10) const uint Ur = 1;
+layout(constant_id = 11) const uint Uc = 1;
+layout(constant_id = 12) const uint causal = 1;
+layout(constant_id = 13) const float scaling = 1.0;
+layout(constant_id = 14) const uint subgroupSize = 32;
+// local_size_x will be always a multiply of numOfParallelSubgroups * subgroupSize:
+layout(local_size_x_id = 15, local_size_y = 1, local_size_z = 1) in;
+
+//#define DEBUG_SAVE_S
+//#define DEBUG_SAVE_PIJT
+//#define SAVE_L
+#define ENABLE_SHMEM_PAD 1
+
+// Input format: BHSD = (B=batch, H=number of heads, S=sequence, D=head dim)
+const uint dimB = inputSize/strideInputB;
+const uint dimH = inputSize/(dimB*strideInputH);
+const uint dimS = inputSize/(dimB*dimH*strideInputS);
+const uint dimD = inputSize/(dimB*dimH*dimS*strideInputD);
+
+// Calculating warptile and blocktile sizes
+
+// Number of coopmats in the d dimension
+const uint Vd = dimD/lK;
+// Warptile size (rows, columns)
+const uint Wr = Vr * lM;
+const uint Wc = Vc * lN;
+// Blocktile size (rows, columns)
+const uint Br = Ur * Wr;
+const uint Bc = Uc * Wc;
+// Number of blocks processed by the kernel
+const uint Tc = dimS / Bc;
+
+// The full problem (B, H, S, D) was split into exactly (B*H*S)/Br workgroups.
+// The actual head is uniquely defined by the (bId, hId) pair.
+// We determine the batch, head and row blocktile id for the actual kernel.
+// * bId: the batch id
+// * hId: the actual head id
+// * sId: the actual row-blocktile id to be processed by this kernel
+
+uint actSubproblemRowId = gl_WorkGroupID.x*Br;
+uint bId = actSubproblemRowId / (dimH*dimS);
+uint hId = (actSubproblemRowId - bId*dimH*dimS) / dimS;
+uint sId = (actSubproblemRowId - bId*dimH*dimS - hId*dimS) / Br;
+
+// The offset of the data for the actual head in the Q, Kt, V, O buffers.
+uint actHeadOffsetInOut = strideInputB*bId + strideInputH*hId;
+// We assume that S is densely packed.
+uint actHeadOffsetS = bId*(dimH*dimS*dimS) + hId*(dimS*dimS);
+
+// Q matrix
+layout(buffer_reference) buffer InputQV4 { 
+    uvec4 x[];
+};
+
+// Kt matrix
+layout(buffer_reference) buffer InputKtV4 { 
+    uvec4 x[]; 
+};
+
+// V matrix
+// TODO rename to InputVV4
+layout(buffer_reference) buffer InputVV4 {
+    uvec4 x[]; 
+};
+
+// O matrix
+layout(buffer_reference) buffer OutputO {
+    C_TYPE x[]; 
+};
+
+// L matrix (unused in forward)
+layout(buffer_reference) buffer OutputL { 
+    C_TYPE x[]; 
+};
+
+// -- Debug buffers --
+
+// S matrix 
+layout(buffer_reference) buffer OutputS {
+    S_TYPE x[]; 
+};
+
+// Output tiles fo debugging
+
+// Q tile (debug)
+layout(buffer_reference) buffer OutputQT {
+    A_TYPE x[]; 
+};
+
+// Kt tile (debug)
+layout(buffer_reference) buffer OutputKtT {
+    A_TYPE x[]; 
+};
+
+// S tile (debug)
+layout(buffer_reference) buffer OutputST {
+    S_TYPE x[]; 
+};
+
+layout(set=0, binding=0, std430) uniform Params {
+    InputQV4 inputQV4;  // Q
+    InputKtV4 inputKtV4;  // Kt
+    InputVV4 inputVV4;      // V
+    OutputO outputO;    // O
+    OutputL outputL;      // L    
+    OutputS outputS;    // S (debug)
+    
+    OutputQT outputQT;  // Q tile (debug)
+    OutputKtT outputKtT;    // Kt tile (debug)
+    OutputST outputST;  // S tile (debug)
+} params;
+
+uint invId = gl_LocalInvocationID.x;
+const uint nInvs = gl_WorkGroupSize.x;
+uint subgroupId = gl_SubgroupID;
+uint nSubgroups = gl_NumSubgroups; // Equal to nInvs / subgroupSize;
+
+// -- Global variables/constants --
+
+const uvec2 tileDimsQ = uvec2(Br, dimD);
+const uvec2 tileDimsKt = uvec2(dimD, Bc);
+const uvec2 tileDimsV = uvec2(Bc, dimD);
+const uvec2 tileDimsO = uvec2(Br, dimD);
+const uvec2 tileDimsS = uvec2(Br, Bc);
+
+// Storage precision for each matrix
+const uint bitsQ = A_BITS;
+const uint bitsKt = A_BITS;
+const uint bitsV = A_BITS;
+const uint bitsO = C_BITS;
+const uint bitsS = S_BITS;
+
+// Number of components per element in each matrix
+const uint bytesPerUvec4 = 16;
+
+// Granularity of buffers in the global memory/shared memory.
+const uint granularityQ = bytesPerUvec4 / (bitsQ / 8);
+const uint granularityKt = bytesPerUvec4 / (bitsKt / 8);
+const uint granularityV = bytesPerUvec4 / (bitsV / 8);
+const uint granularityS = 1;
+const uint granularityO = 1;
+
+const uint granularitySharedQ = granularityQ;
+const uint granularitySharedKt = granularityKt;
+const uint granularitySharedV = granularityV;
+const uint granularitySharedS = bytesPerUvec4 / (bitsS / 8);
+const uint granularitySharedO = bytesPerUvec4 / (bitsO / 8);
+
+const uint strideGlobQ = dimD;
+const uint strideGlobK = dimD;
+const uint strideGlobKt = dimS;
+const uint strideGlobV = dimD;
+const uint strideGlobO = dimD;
+const uint strideGlobS = dimS;
+
+const uint strideSharedQ = tileDimsQ[1] + granularitySharedQ * ENABLE_SHMEM_PAD;
+const uint strideSharedKt = tileDimsKt[1] + granularitySharedKt * ENABLE_SHMEM_PAD;
+const uint strideSharedV = tileDimsV[1] + granularitySharedV * ENABLE_SHMEM_PAD;
+const uint strideSharedO = tileDimsO[1] + granularitySharedO * ENABLE_SHMEM_PAD;
+const uint strideSharedS = tileDimsS[1] + granularitySharedS * ENABLE_SHMEM_PAD;
+
+const uint lenSharedQ = tileDimsQ[0] * strideSharedQ / granularitySharedQ;
+shared uvec4 sharedQ[lenSharedQ];
+const uint lenSharedKt = tileDimsKt[0] * strideSharedKt / granularitySharedKt;
+shared uvec4 sharedKt[lenSharedKt];
+const uint lenSharedV = tileDimsV[0] * strideSharedV / granularitySharedV;
+shared uvec4 sharedV[lenSharedV];
+const uint lenSharedO = tileDimsO[0] * strideSharedO / granularitySharedO;
+shared uvec4 sharedO[lenSharedO];
+const uint lenSharedS = tileDimsS[0] * strideSharedS / granularitySharedS;
+shared uvec4 sharedS[lenSharedS];
+
+// Functions to directly manipulate packed elements
+// uvec4 of fp16s
+
+struct fp16x4x2 {
+    float16_t values[8];
+};
+
+fp16x4x2 fp16x4x2_init(float a0, float a1, float a2, float a3, float a4, float a5, float a6, float a7){
+    return fp16x4x2(float16_t[8](
+        float16_t(a0), float16_t(a1), float16_t(a2), float16_t(a3), 
+        float16_t(a4), float16_t(a5), float16_t(a6), float16_t(a7)));    
+}
+
+fp16x4x2 fp16x4x2_init_zeros(){
+    return fp16x4x2_init(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+}
+
+fp16x4x2 fp16x4x2_unpackUvec4(uvec4 elem){
+    vec2 e0 = unpackHalf2x16(elem.x);
+    vec2 e1 = unpackHalf2x16(elem.y);
+    vec2 e2 = unpackHalf2x16(elem.z);
+    vec2 e3 = unpackHalf2x16(elem.w);
+    return fp16x4x2(float16_t[8](
+        float16_t(e0.x), float16_t(e0.y), float16_t(e1.x), float16_t(e1.y), 
+        float16_t(e2.x), float16_t(e2.y), float16_t(e3.x), float16_t(e3.y)));
+}
+
+uvec4 fp16x4x2_packUvec4(fp16x4x2 elem){
+    return uvec4(
+        packHalf2x16(vec2(elem.values[0], elem.values[1])), 
+        packHalf2x16(vec2(elem.values[2], elem.values[3])), 
+        packHalf2x16(vec2(elem.values[4], elem.values[5])), 
+        packHalf2x16(vec2(elem.values[6], elem.values[7])));
+}
+
+fp16x4x2 mul(fp16x4x2 x, float v){
+    [[unroll]] for(int i = 0; i < 8; i++){
+        x.values[i] = float16_t(x.values[i] * v);
+    }
+    return x;
+}
+
+#define STORE_fp16x4x2(BUFFER, START_IDX, VAR) \
+[[unroll]] for(int i = 0; i < 8; i++){ \
+    BUFFER[START_IDX+i] = VAR.values[i]; \
+} \
+
+// uvec4 of fp32s
+
+struct fp32x4 {
+    float values[4];
+};
+
+fp32x4 fp32x4_init(float a0, float a1, float a2, float a3){
+    return fp32x4(float[4](float(a0), float(a1), float(a2), float(a3)));
+}
+
+fp32x4 fp32x4_init_zeros(){
+    return fp32x4_init(0.0, 0.0, 0.0, 0.0);
+}
+
+uvec4 fp32x4_packUvec4(fp32x4 elem){
+    return uvec4(
+        floatBitsToUint(elem.values[0]),
+        floatBitsToUint(elem.values[1]),
+        floatBitsToUint(elem.values[2]),
+        floatBitsToUint(elem.values[3])                        
+    );
+}
+
+fp32x4 fp32x4_unpackUvec4(uvec4 packed){
+    return fp32x4_init(
+        uintBitsToFloat(packed[0]), 
+        uintBitsToFloat(packed[1]), 
+        uintBitsToFloat(packed[2]), 
+        uintBitsToFloat(packed[3]));
+}
+
+fp32x4 mul(fp32x4 x, float v){
+    [[unroll]] for(int i = 0; i < 8; i++){
+        x.values[i] = float(x.values[i] * v);
+    }
+    return x;
+}
+
+#define STORE_fp32x4(BUFFER, START_IDX, VAR) \
+[[unroll]] for(int i = 0; i < 4; i++){ \
+    BUFFER[START_IDX+i] = VAR.values[i]; \
+} \
+
+// Utility functions
+
+uint coordToOffset(uint i, uint j, uint stride){
+    return stride * i + j;
+}
+
+uint coordToOffset(uvec2 coord, uint stride){
+    return stride * coord[0] + coord[1];
+}
+
+uint splitWork(uint workSize){
+    return (nInvs + workSize -1) / nInvs;
+}
+
+// splitWork for Br that is known at pipeline creation time.
+const uint nElemsOfBrPerInv = (Br + nInvs -1) / nInvs;
+
+// Problem tiling
+// ------
+// We follow the usual strategy (blocktiling, warptiling and subproblem solving (in this case, coopmats)).
+
+// Computing warptile parameters
+// * Wr = Cr * Vr (Warp tile size = cooperative matrix size multiplied by the number of cooperative matrices in a warp)
+// * Wc = Cc * Vc
+// Computing blocktile parameters:
+// * Br = Wr * Ur (Block tile size = warp tile size multiplied by the number of warp tiles in a block)
+// * Bc = Wc * Uc
+// Input problem parameters:
+// * s = Br * Tr (Matrix size = block tile size multiplied by the number of block)
+// * s = Bc * Tc
+// * d = Cd * Vd
+
+// From the computed parameters, the tile sizes are the following (assuming that):
+// *lM = Cr
+// *lN = Cc
+// *lK = Cd (the number of coopmats in the "d" dimension)
+
+//   Input          Blocktile   Warptile    Coopmat tile
+//   -----          ---------   --------    ------------
+// * Q = s x d      (Br x d)    (Wr x d)    (Cr x Cd)
+// * Kt = d x s     (d x Bc)    (d x Bc)    (Cd x Cc) (V is of dimension (Cr x Cc), only works when Cd=Cc, see below)
+// * V = s x d      (Bc x d)    (Bc x d)    (Cd x Cc)
+// * O = s x d      (Br x d)    (Wr x d)    (Cr x Cc)
+
+// Cooperative matrix compatibility
+// As we do double matrix multiply in a single kernel with one (lM, lN, lK) configuration, we need to make sure
+// that lN = lK. Otherwise, we need to store the intermediate result into the shared memory, and loading back again.
+// TODO: In the latter case we still need to check if the dimensions are compatible!
+// In particular, in forward mode, there are two matmuls of sizes: 
+// * (Cr x Cd) @ (Cd x Cc) = (Cr x Cc) coopmat tiles
+// * (Cr x Cc) @ (Cc x Cd) = (Cr x Cd).
+// This naturally works when the problem size (Cr, Cd, Cc) is such that Cd=Cc.
+
+// Coalesced transfer of a submatrix from global memory to registerfile (pulled from Jeff Bolz's implementation).
+// --------------------------------------------------------------------------------------------------------------
+// The tile is distributed among the threads of the workgroup.
+// Matrix size to read: 128*64 and nInvs is 256:
+//  - each threaad loads (128*64)/256=32 elements:
+//  - thread#0: read:   x[0],   x[256], x[512], x[768], ... [7936] tileColumId=0/128=0,         tileRowId=[0/128, 256/128, 512/128, ..., 7936/128]
+//  - thread#1: read:   x[1],   x[257], x[513], x[769], ... [7937] tileColumId=1/128=1,         tileRowId=[0, 2, 4, ..., 62]
+//  - thread#2: read:   x[2],   x[258], x[514], x[770], ... [7938] tileColumId=2/128=2,         tileRowId=[0, 2, 4, ..., 62]
+//      ...
+//  - thread#255: read: x[255], x[511], x[1023], x[1023], ... [8191] tileColumId=255/128=127,   tileRowId=[0, 2, 4, ..., 62]
+
+// Asserts:
+// tileDims[0]*tileDims[1] / granularity >= numOfThreads (this is fixed by introducing nOfCoopInvs)
+// E.g.: 16*16 array, with granularity of 8 units (8 elements x 2 bytes in fp16 mode = 16 bytes to fully exploit bus width), 
+// then there are (16*16)/8=32 threads to be used.
+// TODO fix issues when handling crops of non integer multiplies of the local size
+
+// Parameters:
+// * tileDims: the size of the tile (height, width) in raw units
+// * granularity: number of raw units per array element (e.g. if the array is of type vec4, then it is 8)
+// * stride of the source array (in raw units)
+// * globBase: the index of the top-left coordinate in the matrix residing in global memory to be extracted (in raw units).
+
+#define GEN_GLOBS_CACHE(MATRIX) \
+/* Number of (idividually accessed) elements (e.g uvec4s) in the tile to load*/ \
+const uint nOfChunks ## MATRIX = ((tileDims ## MATRIX)[0]*(tileDims ## MATRIX)[1]) / granularity ## MATRIX; \
+/* Number of threads to distribute the elements. It is the workgroup size or less in case there is not enough elements for each thread.*/ \
+const uint nOfCoopInvs ## MATRIX = nInvs > nOfChunks ## MATRIX ? nOfChunks ## MATRIX : nInvs; \
+/* Number of elements in each row of the tile to process. */ \
+const uint elemsPerRow ## MATRIX = (tileDims ## MATRIX)[1] / granularity ## MATRIX; \
+/* Number of rows to be processed by the cooperating thread group. */ \
+const uint rowsPerWorgroup ## MATRIX = nOfCoopInvs ## MATRIX / elemsPerRow ## MATRIX; \
+/* Number of elements to store per each thread */ \
+const uint lenTemp ## MATRIX = (tileDims ## MATRIX)[0] / rowsPerWorgroup ## MATRIX; \
+uvec4 temp ## MATRIX[lenTemp ## MATRIX]; \
+
+#define GEN_FUNCTION_LOAD_GLOB_REG(MATRIX, SSBO) \
+void loadGlobReg ## MATRIX(uint globBase){ \
+    [[unroll]] \
+    for (uint i = 0; i < (tileDims ## MATRIX)[0]; i += rowsPerWorgroup ## MATRIX) { \
+        if(gl_LocalInvocationID.x < nOfCoopInvs ## MATRIX){ \
+            uint tileColumnId = granularity ## MATRIX * (gl_LocalInvocationID.x % elemsPerRow ## MATRIX); \
+            uint tileRowId = i + gl_LocalInvocationID.x / (elemsPerRow ## MATRIX); \
+            (temp ## MATRIX)[i / (rowsPerWorgroup ## MATRIX)] = SSBO[(globBase + strideGlob ## MATRIX * tileRowId + tileColumnId)/(granularity ## MATRIX)]; \
+        } \
+    } \
+}\
+
+// Transfers the matrix stored in registerfile to the shared memory.
+// Source and destination has the same ganularity and type.
+// Global variables used:
+// * shared ## MATRIX: source
+// * temp ## MATRIX: destination
+// * nOfCoopInvs ## MATRIX: see in GEN_GLOBS_CACHE
+// * rowsPerWorgroup ## MATRIX: see in GEN_GLOBS_CACHE
+// * elemsPerRow ## MATRIX: see in GEN_GLOBS_CACHE
+// * tileDims ## MATRIX: the dimension of the matrix
+// * granularity ## MATRIX: the granularity of the elements in the shared memory.
+// * strideShared ## MATRIX: the stride of the shared memory storage (in units).
+
+#define GEN_FUNCTION_STORE_REG_SHARED(MATRIX) \
+void storeRegShared ## MATRIX(){\
+    if(gl_LocalInvocationID.x < nOfCoopInvs ## MATRIX){ \
+        [[unroll]] \
+        for (uint i = 0; i < (tileDims ## MATRIX)[0]; i += rowsPerWorgroup ## MATRIX) { \
+            /* Coordinates in the tile in units. */ \
+            uint tileColumnId = granularity ## MATRIX * (gl_LocalInvocationID.x % elemsPerRow ## MATRIX); \
+            uint tileRowId = i + gl_LocalInvocationID.x / elemsPerRow ## MATRIX; \
+            uvec4 elemPacked = temp ## MATRIX[i / (rowsPerWorgroup ## MATRIX)]; \
+            shared ## MATRIX [(strideShared ## MATRIX * tileRowId  + tileColumnId) / granularity ## MATRIX] = elemPacked; \
+        } \
+    }\
+}\
+
+// Transfers a matrix stored in the registerfile to the shared memory transposed.
+// Destination has granularity 1, while the input is an uvec4 of float16 values.
+#define GEN_FUNCTION_STORE_REG_TRANSPOSED_SHARED(MATRIX, MATRIX_TRANSPOSED) \
+void storeRegTransposedShared ## MATRIX ## _ ## MATRIX_TRANSPOSED(){\
+    if(gl_LocalInvocationID.x < nOfCoopInvs ## MATRIX){ \
+        [[unroll]] \
+        for (uint i = 0; i < (tileDims ## MATRIX)[0]; i += rowsPerWorgroup ## MATRIX) { \
+            /* unit locations */ \
+            uint tileColumnId = granularity ## MATRIX * (gl_LocalInvocationID.x % elemsPerRow ## MATRIX); \
+            uint tileRowId = i + gl_LocalInvocationID.x / elemsPerRow ## MATRIX; \
+            uvec4 elemPacked = temp ## MATRIX[i / (rowsPerWorgroup ## MATRIX)]; \
+            /* We need to unpack the packed element to access individual values and store in the shared memory transposed. */ \
+            fp16x4x2 elemUnpacked = fp16x4x2_unpackUvec4(elemPacked); \
+            for(int j = 0; j < elemUnpacked.values.length(); j++){ \
+                /* y and x coordinate of the non-transposed tile*/ \
+                uint yc = tileRowId; \
+                uint xc = tileColumnId + j; \
+                shared ## MATRIX_TRANSPOSED [strideShared ## MATRIX_TRANSPOSED * xc  + yc] = elemUnpacked.values[j]; \
+            } \
+        } \
+    }\
+}\
+
+// Initializes a shared memory array with a value.
+// Global variables used.
+// * shared ## BUFFER: shared memory array to process.
+// * lenShared ## BUFFER: number of elements in the array.
+#define GEN_FUNCTION_INIT_SHARED(BUFFER, VALUE) \
+void initShared ## BUFFER(){ \
+    uint elemsPerInv = splitWork(lenShared ## BUFFER); \
+    for(uint i = 0; i < elemsPerInv; i++){ \
+        uint sharedIdx = invId*elemsPerInv + i; \
+        if(sharedIdx < lenShared ## BUFFER){ \
+            shared ## BUFFER[sharedIdx] = VALUE; \
+        } \
+    } \
+}
+
+
+// Transfers a matrix stored in the shared memory to the global memory.
+// Source is of type uvec4 and destination has raw element type.
+// Uses the following variables:
+// * shared ## MATRIX: source buffer
+// * params.output ## MATRIX.x: target buffer
+// * tileDims ## MATRIX: dimension of the matrix
+// * granularityShared ## MATRIX: granularity in the source buffer
+// * strideShared ## MATRIX: stride in the source buffer
+// * strideGlob ## MATRIX: stride in the target buffer
+// Macro parameters:
+// * MATRIX: the matrix to copy.
+// * UNPACK_FUNCTION: this function will be applied to unpack an uvec4
+// * STORE_FUNCTION: this function will be used to store the unpacked uvec4
+
+#define GEN_FUNCTION_STORE_SHARED_GLOB(MATRIX, UNPACK_FUNCTION, STORE_FUNCTION) \
+void storeSharedGlob ## MATRIX(uint globOffset){ \
+    uint rowsPerInv = splitWork(tileDims ## MATRIX[0]); \
+    [[unroll]] for(int i = 0; i < rowsPerInv; i++){ \
+        uint rowId = invId*rowsPerInv+i; \
+        uvec2 tileDims = uvec2(tileDims ## MATRIX[0], tileDims ## MATRIX[1]); \
+        if(rowId < tileDims[0]){ \
+            [[unroll]] for(uint j = 0; j < tileDims[1]; j+=granularityShared ## MATRIX){ \
+                uint idxInShared = (rowId * strideShared ## MATRIX + j)/granularityShared ## MATRIX; \
+                uvec4 elem = shared ## MATRIX[idxInShared]; \
+                uvec2 coordInShared = uvec2(rowId, j); \
+                uint offsetInGlob = globOffset + coordToOffset(coordInShared, strideGlob ## MATRIX); \
+                STORE_FUNCTION(params.output ## MATRIX.x, offsetInGlob, UNPACK_FUNCTION(elem)); \
+            } \
+        } \
+    } \
+} \
+
+GEN_GLOBS_CACHE(Q)
+GEN_FUNCTION_STORE_REG_SHARED(Q)
+GEN_FUNCTION_LOAD_GLOB_REG(Q, params.inputQV4.x)
+
+GEN_GLOBS_CACHE(Kt)
+GEN_FUNCTION_STORE_REG_SHARED(Kt)
+GEN_FUNCTION_LOAD_GLOB_REG(Kt, params.inputKtV4.x)
+
+GEN_GLOBS_CACHE(V)
+GEN_FUNCTION_STORE_REG_SHARED(V)
+GEN_FUNCTION_LOAD_GLOB_REG(V, params.inputVV4.x)
+
+#if C_BITS==32
+    GEN_FUNCTION_INIT_SHARED(O, fp32x4_packUvec4(fp32x4_init_zeros()))
+    GEN_FUNCTION_STORE_SHARED_GLOB(O, fp32x4_unpackUvec4, STORE_fp32x4)        
+#elif C_BITS==16
+    GEN_FUNCTION_INIT_SHARED(O, fp16x4x2_packUvec4(fp16x4x2_init_zeros()))
+    GEN_FUNCTION_STORE_SHARED_GLOB(O, fp16x4x2_unpackUvec4, STORE_fp16x4x2)
+#else
+#error Datatype is not supported yet.
+#endif
+
+#if S_BITS==32
+    GEN_FUNCTION_INIT_SHARED(S, fp32x4_packUvec4(fp32x4_init_zeros()))
+    GEN_FUNCTION_STORE_SHARED_GLOB(S, fp32x4_unpackUvec4, STORE_fp32x4)        
+#elif S_BITS==16
+    GEN_FUNCTION_INIT_SHARED(S, fp16x4x2_packUvec4(fp16x4x2_init_zeros()))
+    GEN_FUNCTION_STORE_SHARED_GLOB(S, fp16x4x2_unpackUvec4, STORE_fp16x4x2)
+#else
+#error Datatype is not supported yet.
+#endif
+
+int getDiagonalStatus(uint blockTileR, uint Br, uint blockTileC, uint Bc){
+    // Returns 
+    // * 0 if tile is on the diagonal
+    // * 1 if tile is above the diagonal
+    // * -1 if tile is below the diagonal.
+    
+    uvec2 topRightCoord = uvec2(blockTileR*Br, (blockTileC+1)*Bc-1);
+    uvec2 bottomLeftCoord = uvec2((blockTileR+1)*Br-1, blockTileC*Bc);
+    
+    if(bottomLeftCoord[0] <  bottomLeftCoord[1]){
+        return 1;
+    }else if(topRightCoord[1] < topRightCoord[0]){
+        return -1;
+    }else{
+        return 0;
+    }
+}
+
+void flashAttention(){
+    // --- Blocktiling ---
+    uint blockTileR = sId;
+    uvec2 blockTileCoordGlobQ = uvec2(Br * blockTileR, 0);
+    uvec2 blockTileCoordGlobO = uvec2(Br * blockTileR, 0);
+
+    uint globBaseQ = actHeadOffsetInOut + coordToOffset(blockTileCoordGlobQ, strideGlobQ);
+    loadGlobRegQ(globBaseQ);
+    storeRegSharedQ();
+
+    // Zero out S, O
+    initSharedO();
+    initSharedS();
+
+    S_TYPE mi_j[nElemsOfBrPerInv];
+    S_TYPE li_j[nElemsOfBrPerInv];        
+    for(uint i = 0; i < nElemsOfBrPerInv; i++){
+        if(i < Br){
+            mi_j[i] = S_TYPE(-1.0/0.0);
+            li_j[i] = S_TYPE(0.0);
+        }
+    }
+
+    for(uint blockTileC = 0; blockTileC < Tc; blockTileC++){
+        uint diagonal = getDiagonalStatus(blockTileR, Br, blockTileC, Bc);
+
+        if(causal > 0 && diagonal == 1){
+            continue;
+        }
+        
+        uvec2 blockTileCoordGlobS = uvec2(Br*blockTileR, Bc*blockTileC);
+        uvec2 blockTileCoordGlobKt = uvec2(0, Bc * blockTileC);
+        uvec2 blockTileCoordGlobV = uvec2(Bc * blockTileC, 0);
+        
+        if(blockTileC == 0){
+            uint globBaseKt = actHeadOffsetInOut + coordToOffset(blockTileCoordGlobKt, strideGlobKt);
+            uint globBaseV = actHeadOffsetInOut + coordToOffset(blockTileCoordGlobV, strideGlobV);
+            loadGlobRegKt(globBaseKt);
+            loadGlobRegV(globBaseV);
+        }
+        
+        storeRegSharedKt();
+        storeRegSharedV();
+
+        S_TYPE mi_jm1[nElemsOfBrPerInv];
+        S_TYPE li_jm1[nElemsOfBrPerInv];
+        for(uint i = 0; i < nElemsOfBrPerInv; i++){
+            if(i < Br){
+                mi_jm1[i] = mi_j[i];
+                li_jm1[i] = li_j[i];
+            }
+        }
+
+        // --- Warptiling ---
+        
+        // Actual warptile coordinate (for indexing S)
+        uvec2 warpTileCoordS = uvec2(subgroupId / Uc, subgroupId % Uc);
+        uvec2 warpTileCoordShS = warpTileCoordS * uvec2(Wr, Wc);
+        
+        // (i,j) top-left coordinate of the warptile in sharedQ
+        uvec2 warpTileCoordShQ = uvec2(Wr * warpTileCoordS[0], 0);
+        uvec2 warpTileCoordShKt = uvec2(0, Wc * warpTileCoordS[1]);
+
+        uint warpRowId = warpTileCoordS[0];
+        uint warpColId = warpTileCoordS[1];
+        uvec2 warpTileCoordShV = uvec2(Wc * warpColId, 0);
+        uvec2 warpTileCoordShO = uvec2(Wr * warpRowId, 0);
+        
+        // --- Coopmat tiling ---
+
+        barrier();
+
+        // Load O from shared memory to coopmats
+        coopmat<C_TYPE, gl_ScopeSubgroup, lM, lK, gl_MatrixUseAccumulator> coopMatTilesO[Vr][Vd];
+
+        // Initialize coopmat tiles to zero
+        coopmat<S_TYPE, gl_ScopeSubgroup, lM, lN, gl_MatrixUseAccumulator> coopMatTilesS[Vr][Vc];
+        [[unroll]] for(int i = 0; i < Vr; i++){
+            [[unroll]] for(int j = 0; j < Vc; j++){            
+                coopMatTilesS[i][j] = coopmat<S_TYPE, gl_ScopeSubgroup, lM, lN, gl_MatrixUseAccumulator>(S_TYPE(0.0));
+            }
+        }
+        // Load coopmat tiles from shared memory for Q and K^T
+        // Compute outer product using coopmat tiles for Q @ K^T (lMxlK) @ (lKxlN) = (lMxlK)
+        // Store result in shared memory
+        [[unroll]] for(uint coopMatI = 0; coopMatI < Vd; coopMatI++){               // Dot product dimension
+            coopmat<A_TYPE, gl_ScopeSubgroup, lK, lN, gl_MatrixUseB> matKt[Vc];
+            for(uint coopMatC = 0; coopMatC < Vc; coopMatC++){
+                uvec2 coopMatTileCoordShKt = warpTileCoordShKt + uvec2(coopMatI*lK, coopMatC*lN);
+                coopMatLoad(
+                    matKt[coopMatC], 
+                    sharedKt,
+                    coordToOffset(coopMatTileCoordShKt, strideSharedKt)/granularitySharedKt, 
+                    strideSharedKt/granularitySharedKt, 
+                    gl_CooperativeMatrixLayoutRowMajor);
+            }
+
+            coopmat<A_TYPE, gl_ScopeSubgroup, lM, lK, gl_MatrixUseA> matQ[Vr];
+            [[unroll]] for(uint coopMatR = 0; coopMatR < Vr; coopMatR++){           // Rows
+                uvec2 coopMatTileCoordShQ = warpTileCoordShQ + uvec2(coopMatR*lM, coopMatI*lK);                
+                coopMatLoad(
+                    matQ[coopMatR], 
+                    sharedQ,
+                    coordToOffset(coopMatTileCoordShQ, strideSharedQ)/granularitySharedQ, 
+                    strideSharedQ/granularitySharedQ, 
+                    gl_CooperativeMatrixLayoutRowMajor);
+            }
+
+            [[unroll]] for(uint coopMatR = 0; coopMatR < Vr; coopMatR++){           // Columns
+                [[unroll]] for(uint coopMatC = 0; coopMatC < Vc; coopMatC++){
+                    coopMatTilesS[coopMatR][coopMatC] = coopMatMulAdd(matQ[coopMatR], matKt[coopMatC], coopMatTilesS[coopMatR][coopMatC]);                        
+                } // // End of coopmat tiling loop: rows
+            }   // // End of coopmat tiling loop: columns
+        }   // End of coopmat tiling loop: inner
+        // Make sure that all threads finished writing to sharedS
+
+        [[unroll]] for(uint coopMatR = 0; coopMatR < Vr; coopMatR++){
+            [[unroll]] for(uint coopMatC = 0; coopMatC < Vc; coopMatC++){ 
+                uvec2 coopMatTileCoordShS = warpTileCoordShS + uvec2(coopMatR*lM, coopMatC*lN);
+                coopMatStore(
+                    S_TYPE(scaling)*coopMatTilesS[coopMatR][coopMatC], 
+                    sharedS,
+                    coordToOffset(coopMatTileCoordShS, strideSharedS)/granularitySharedS,
+                    strideSharedS/granularitySharedS,
+                    gl_CooperativeMatrixLayoutRowMajor);
+            } // // End of coopmat tiling loop: rows
+        }   // // End of coopmat tiling loop: columns
+
+        barrier();
+
+    #ifdef DEBUG_SAVE_S
+        uint blockTileOffsetS = coordToOffset(blockTileCoordGlobS, strideGlobS);
+        storeSharedGlobS(actHeadOffsetS + blockTileOffsetS);
+    #endif
+
+        if(causal > 0 && diagonal == 0){
+        // Each invocation reads and writes its own line, so we do not need
+        // barrier between the processing steps.
+            [[unroll]] for(int i = 0; i < nElemsOfBrPerInv; i++){
+                uint rowIdBr = invId*nElemsOfBrPerInv+i;
+                // Process diagonal element when causal is enabled
+                if(rowIdBr < Br){
+                    [[unroll]] for(uint j = 0; j < Bc; j+=granularitySharedS){
+                        uint sharedSIdx = (rowIdBr * strideSharedS + j)/granularitySharedS;
+                        uvec4 elem = sharedS[sharedSIdx];
+    #if S_BITS == 16
+                        fp16x4x2 uElem = fp16x4x2_unpackUvec4(elem);
+                        [[unroll]] for(int k = 0; k < uElem.values.length(); k++){
+                            uint colIdBc = j + k;
+                            // Coordinate in the actual head
+                            uvec2 coordInS = uvec2(Br*blockTileR + rowIdBr, Bc*blockTileC + colIdBc);
+                            if(coordInS[1] > coordInS[0]){
+                                uElem.values[k] = S_TYPE(-1.0/0.0);
+                            }
+                        } 
+                        sharedS[sharedSIdx] = fp16x4x2_packUvec4(uElem);
+    #elif S_BITS == 32
+                        fp32x4 uElem = fp32x4_unpackUvec4(elem);
+                        [[unroll]] for(int k = 0; k < uElem.values.length(); k++){
+                            uint colIdBc = j + k;
+                            uvec2 coordInS = uvec2(Br*blockTileR + rowIdBr, Bc*blockTileC + colIdBc);
+                            if(coordInS[1] > coordInS[0]){
+                                uElem.values[k] = S_TYPE(-1.0/0.0);
+                            }
+                        }
+                        sharedS[sharedSIdx] = fp32x4_packUvec4(uElem);
+    #else
+        #error sizeof S should be 2 or 4.
+    #endif                            
+                    }
+                }
+
+            }
+
+            barrier();
+        }
+
+
+        [[unroll]] for(int i = 0; i < nElemsOfBrPerInv; i++){
+            uint rowIdBr = invId*nElemsOfBrPerInv+i;
+            if(rowIdBr < Br){
+            
+                // Compute rowmax(Si_j)
+                S_TYPE rowMaxS = S_TYPE(-1.0/0.0);
+                [[unroll]] for(uint j = 0; j < Bc; j+=granularitySharedS){
+                    uint sharedSIdx = (rowIdBr * strideSharedS + j)/granularitySharedS;
+                    uvec4 elem = sharedS[sharedSIdx];
+    #if S_BITS == 16 
+                    fp16x4x2 uElem = fp16x4x2_unpackUvec4(elem);
+                    [[unroll]] for(int k = 0; k < uElem.values.length(); k++){
+                        rowMaxS = max(uElem.values[k], rowMaxS);
+                    }
+    #elif S_BITS == 32
+                    fp32x4 uElem = fp32x4_unpackUvec4(elem);
+                    [[unroll]] for(int k = 0; k < uElem.values.length(); k++){
+                        rowMaxS = max(uElem.values[k], rowMaxS);
+                    }
+    #else
+        #error sizeof S should be 2 or 4.
+    #endif
+                }
+                
+                // Compute mi_j = max(rowmax(Si_j), mi_jm1)
+                mi_j[i] = max(rowMaxS, mi_jm1[i]);
+
+                // Compute Pijt = exp(Si_j - mi_j)
+                // Compute rowsum(Pijt) = rowsum(Pijt)
+                S_TYPE rowSumPijt = S_TYPE(0.0);
+    #if S_BITS == 32
+                fp16x4x2 mergedElem;
+    #endif
+                [[unroll]] for(uint j = 0; j < Bc; j+=granularitySharedS){
+                
+                    uint sharedSIdx = (rowIdBr * strideSharedS + j)/granularitySharedS;
+                    uvec4 elem = sharedS[sharedSIdx];
+    #if S_BITS == 16
+                    fp16x4x2 uElem = fp16x4x2_unpackUvec4(elem);
+                    [[unroll]] for(int k = 0; k < uElem.values.length(); k++){
+                        S_TYPE _exp = exp(uElem.values[k] - mi_j[i]);
+                        rowSumPijt += _exp;
+                        uElem.values[k] = _exp;
+                    }
+                    sharedS[sharedSIdx] = fp16x4x2_packUvec4(uElem);
+    #elif S_BITS == 32
+                    fp32x4 uElem = fp32x4_unpackUvec4(elem);
+                    [[unroll]] for(int k = 0; k < uElem.values.length(); k++){
+                        S_TYPE _exp = exp(uElem.values[k] - mi_j[i]);
+                        rowSumPijt += _exp;
+                        uElem.values[k] = _exp;
+                    }
+                    
+                    // Merge subsequent elements and save
+                    if((j/granularitySharedS) % 2 == 0){
+                        [[unroll]] for(uint k = 0; k < uElem.values.length(); k++){
+                            mergedElem.values[k] = A_TYPE(uElem.values[k]);
+                        }
+                    }else{
+                        [[unroll]] for(uint k = 0; k < uElem.values.length(); k++){
+                            mergedElem.values[4+k] = A_TYPE(uElem.values[k]);
+                        }
+                        
+                        uint targetSharedSIdx = (rowIdBr * strideSharedS + (j-1)/2)/granularitySharedS;                        
+                        sharedS[targetSharedSIdx] = fp16x4x2_packUvec4(mergedElem);
+                    }
+    #else
+        #error sizeof S should be 2 or 4.
+    #endif                        
+                }
+
+                // Set scaleFactor = exp(mi_jm-1 - mi_j)
+                // Compute li_j = np.exp(mi_jm1 - mi_j) * li_jm1 + np.sum(Pijt, axis=1, keepdims=True)
+                S_TYPE scaleFactor = exp(mi_jm1[i] - mi_j[i]);
+                li_j[i] = scaleFactor * li_jm1[i] + rowSumPijt;
+                
+                // Compute diag(exp(mi_jm1 - mi_j)) @ Oi_jm1
+                [[unroll]] for(uint j = 0; j < dimD; j+= granularitySharedO){
+                    uint sharedOIdx = (rowIdBr * strideSharedO + j)/granularitySharedO;
+                    uvec4 elem = sharedO[sharedOIdx];
+
+    #if C_BITS==16
+                    fp16x4x2 uElem = mul(fp16x4x2_unpackUvec4(elem), scaleFactor);
+                    sharedO[sharedOIdx] = fp16x4x2_packUvec4(uElem);
+    #elif C_BITS==32
+                    fp32x4 uElem = mul(fp32x4_unpackUvec4(elem), scaleFactor);
+                    sharedO[sharedOIdx] = fp32x4_packUvec4(uElem);
+    #else
+        #error sizeof C should be 2 or 4.
+    #endif                        
+                }
+            }
+        }
+
+        barrier();
+
+        [[unroll]] for(uint coopMatR = 0; coopMatR < Vr; coopMatR++){
+            [[unroll]] for(uint coopMatC = 0; coopMatC < Vd; coopMatC++){                     
+                uvec2 coopMatTileCoordShO = warpTileCoordShO + uvec2(coopMatR*lM, coopMatC*lK);
+                coopMatLoad(
+                    coopMatTilesO[coopMatR][coopMatC],
+                    sharedO,
+                    coordToOffset(coopMatTileCoordShO, strideSharedO)/granularitySharedO,
+                    strideSharedO/granularitySharedO,
+                    gl_CooperativeMatrixLayoutRowMajor
+                );
+            }
+        }
+
+        #ifdef SAVE_L
+        for(int i = 0; i < nElemsOfBrPerInv; i++){
+            uint rowIdBr = invId*nElemsOfBrPerInv+i;
+            if(rowId < rowIdBr){
+                params.outputL.x[rowId] = C_TYPE(mi_j[i]);
+            }
+        }
+        #endif
+
+        #ifdef DEBUG_SAVE_PIJT
+            uint blockTileOffsetS = coordToOffset(blockTileCoordGlobS, strideGlobS);
+            storeSharedGlobS(actHeadOffsetS + blockTileOffsetS);
+        #endif
+
+        // Load next tile while computing matmul
+        if(blockTileC < Tc-1){
+            uvec2 nextBlockTileCoordGlobKt = uvec2(0, Bc * (blockTileC+1));
+            uvec2 nextBlockTileCoordGlobV = uvec2(Bc * (blockTileC+1), 0);
+
+            uint globBaseKt = actHeadOffsetInOut + coordToOffset(nextBlockTileCoordGlobKt, strideGlobK);
+            uint globBaseV = actHeadOffsetInOut + coordToOffset(nextBlockTileCoordGlobV, strideGlobV);
+
+            loadGlobRegKt(globBaseKt);
+            loadGlobRegV(globBaseV);
+        }
+
+        // --- Store S, compute normalization term for the data in shared memory S 
+        
+        // Load coopmat tiles for S from sharedS (convert to AType if accumulator is in different type),
+        // Compute outer product using coopmat tiles for S @ V (lMxlN) @ (lNxlK) = (lMxlK)
+        // Save the result in sharedO
+        
+        [[unroll]] for(uint coopMatI = 0; coopMatI < Vc; coopMatI++){               // Dot product dimension
+            [[unroll]] for(uint coopMatR = 0; coopMatR < Vr; coopMatR++){           // Iterate through the rows
+                coopmat<A_TYPE, gl_ScopeSubgroup, lM, lN, gl_MatrixUseA> matS;
+                uvec2 coopMatTileCoordShS = warpTileCoordShS + uvec2(coopMatR*lM, coopMatI*lN);
+                coopMatLoad(
+                    matS,
+                    sharedS,
+                    coordToOffset(coopMatTileCoordShS, strideSharedS)/granularitySharedS,
+                    strideSharedS/granularitySharedS,
+                    gl_CooperativeMatrixLayoutRowMajor
+                );
+                
+                [[unroll]] for(uint coopMatC = 0; coopMatC < Vd; coopMatC++){       // Iterate through the columns
+                    coopmat<A_TYPE, gl_ScopeSubgroup, lN, lK, gl_MatrixUseB> matV;                            
+                    uvec2 coopMatTileCoordShV = warpTileCoordShV + uvec2(coopMatI*lN, coopMatC*lK);
+                    coopMatLoad(
+                        matV,
+                        sharedV,
+                        coordToOffset(coopMatTileCoordShV, strideSharedV)/granularitySharedV,
+                        strideSharedV/granularitySharedV,
+                        gl_CooperativeMatrixLayoutRowMajor
+                    );
+                    
+                    coopMatTilesO[coopMatR][coopMatC] = coopMatMulAdd(matS, matV, coopMatTilesO[coopMatR][coopMatC]);
+                    
+                    if(coopMatI == Vc-1){
+                        uvec2 coopMatTileCoordShO = warpTileCoordShO + uvec2(coopMatR*lM, coopMatC*lK);
+                        coopMatStore(
+                            //coopmat<C_TYPE, gl_ScopeSubgroup, lM, lK, gl_MatrixUseAccumulator>(C_TYPE(1.0)) * C_TYPE(blockTileCoordV),
+                            coopMatTilesO[coopMatR][coopMatC],
+                            sharedO,
+                            coordToOffset(coopMatTileCoordShO, strideSharedO)/granularitySharedO,
+                            strideSharedO/granularitySharedO,
+                            gl_CooperativeMatrixLayoutRowMajor
+                        );
+                    }
+                } // End of coopmat tiling loop: rows
+            }   // End of coopmat tiling loop: columns
+        }   // End of coopmat tiling loop: inner
+
+        barrier();
+        
+    } // End of blocktiling loop: columns
+
+    // Compute inv(diag(li_j)) @ Oi_j
+    [[unroll]] for(int i = 0; i < nElemsOfBrPerInv; i++){
+        uint rowIdO = invId*nElemsOfBrPerInv+i;        
+        if(rowIdO < tileDimsO[0]){
+            [[unroll]] for(uint j = 0; j < dimD; j+= granularitySharedO){
+                uint sharedOIdx = (rowIdO * strideSharedO + j)/granularitySharedO;;
+                uvec4 elem = sharedO[sharedOIdx];
+
+    #if C_BITS==16
+                fp16x4x2 uElem = mul(fp16x4x2_unpackUvec4(elem), 1.0/li_j[i]);
+                //fp16x4x2 uElem = mul(fp16x4x2_unpackUvec4(elem), 1.0/1.0);
+                sharedO[sharedOIdx] = fp16x4x2_packUvec4(uElem);
+    #elif C_BITS==32
+                fp32x4 uElem = mul(fp32x4_unpackUvec4(elem), 1.0/li_j[i]);
+                sharedO[sharedOIdx] = fp32x4_packUvec4(uElem);
+    #else
+        #error sizeof C should be 2 or 4.
+    #endif
+            }
+        }
+    }
+    barrier();
+
+    // Finally, save sharedO to the global memory        
+    uint blockTileOffsetO = coordToOffset(blockTileCoordGlobO, strideGlobO);
+    storeSharedGlobO(actHeadOffsetInOut + blockTileOffsetO);
+}
+
+void main(){
+    flashAttention();
+}
+
