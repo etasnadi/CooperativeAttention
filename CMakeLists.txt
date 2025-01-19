@@ -50,23 +50,23 @@ set(SHADER_DIR shaders)
 
 set(GLSLANG_ARGS 
     "--target-env spirv1.3 -DA_BITS=16 -DA_TYPE=float16_t -DS_BITS=16 -DS_TYPE=float16_t -DC_BITS=16 -DC_TYPE=float16_t"
-    "--target-env spirv1.3 -DA_BITS=16 -DA_TYPE=float16_t -DS_BITS=16 -DS_TYPE=float16_t -DC_BITS=32 -DC_TYPE=float"
-    "--target-env spirv1.3 -DA_BITS=16 -DA_TYPE=float16_t -DS_BITS=32 -DS_TYPE=float -DC_BITS=16 -DC_TYPE=float16_t"    
-    "--target-env spirv1.3 -DA_BITS=16 -DA_TYPE=float16_t -DS_BITS=32 -DS_TYPE=float -DC_BITS=32 -DC_TYPE=float"    
+#    "--target-env spirv1.3 -DA_BITS=16 -DA_TYPE=float16_t -DS_BITS=16 -DS_TYPE=float16_t -DC_BITS=32 -DC_TYPE=float -DDEBUG_MODE"
+#    "--target-env spirv1.3 -DA_BITS=16 -DA_TYPE=float16_t -DS_BITS=32 -DS_TYPE=float -DC_BITS=16 -DC_TYPE=float16_t -DDEBUG_MODE"
+#    "--target-env spirv1.3 -DA_BITS=16 -DA_TYPE=float16_t -DS_BITS=32 -DS_TYPE=float -DC_BITS=32 -DC_TYPE=float -DDEBUG_MODE"
 )
 
 set(SHADER_INPUT_FILES
     "sdpa_flash.comp"
-    "sdpa_flash.comp"
-    "sdpa_flash.comp"
-    "sdpa_flash.comp"        
+#    "sdpa_flash.comp"
+#    "sdpa_flash.comp"
+#    "sdpa_flash.comp"        
 )
 
 set(SHADER_OUTPUT_FILES
     "sdpa_flash-sfp16-cfp16.spv"
-    "sdpa_flash-sfp16-cfp32.spv"    
-    "sdpa_flash-sfp32-cfp16.spv"
-    "sdpa_flash-sfp32-cfp32.spv"
+#    "sdpa_flash-sfp16-cfp32.spv"    
+#    "sdpa_flash-sfp32-cfp16.spv"
+#    "sdpa_flash-sfp32-cfp32.spv"
 )
 
 add_custom_command(

@@ -614,9 +614,11 @@ void flashAttentionHost(const MatrixDesc<InputType> &Q,
                         const MatrixDesc<InputType> &V,
                         MatrixDesc<AccumulatorType> &O,
                         MatrixDesc<AccumulatorType> &L,
-                        MatrixDesc<IntermediateType> &S, int Br, int Bc,
+                        MatrixDesc<IntermediateType> &S, 
+                        MatrixDesc<InputType> &P, 
+                        int Br, int Bc,
                         IntermediateType scaling = IntermediateType(1.0),
-                        std::ostream &log = std::cout) {
+                        bool saveS=false, bool savePijt=false, std::ostream &log = std::cout) {
 
   log << "Host computation (flash attention)... Types "
          "(Input/Intermediate/Accumulator): "
@@ -663,8 +665,9 @@ void flashAttentionHost(const MatrixDesc<InputType> &Q,
           tmpSi_j.template copy<IntermediateType>();
       Si_j.multiplyScalar_(scaling);
 
-      // Save S
-      S.pasteSubMatrix(Si_j, Br * tileI, Bc * tileJ);
+      if(saveS){
+        S.pasteSubMatrix(Si_j, Br * tileI, Bc * tileJ);
+      }
 
       // maxSi_j = rowmax(Si_j)
       MatrixDesc<IntermediateType> maxSi_j = Si_j.rowMax();
@@ -707,6 +710,12 @@ void flashAttentionHost(const MatrixDesc<InputType> &Q,
 
       // Oi_j = diag(exp(mi_jm1 - mi_j)) @ Oi_jm1 + Pijt @ Vj
       MatrixDesc<InputType> tmp_Pijt = Pijt.template copy<InputType>();
+
+      // Save Pijt
+      if(savePijt){
+        P.pasteSubMatrix(tmp_Pijt, Br * tileI, Bc * tileJ);
+      }
+
       MatrixDesc<AccumulatorType> PijtVj =
           MatrixDesc<AccumulatorType>(Pijt.dims.rows, Vj.dims.cols);
       MatrixDesc<AccumulatorType>::template multiply<InputType,
@@ -751,7 +760,7 @@ void attentionHost(const MatrixDesc<InputType> &Q,
                    const MatrixDesc<InputType> &V,
                    MatrixDesc<IntermediateType> &S,
                    MatrixDesc<AccumulatorType> &O,
-                   MatrixDesc<IntermediateType> &P, bool causal = false,
+                   MatrixDesc<InputType> &P, bool causal = false,
                    IntermediateType scaling = IntermediateType(1.0),
                    std::ostream &log = std::cout) {
 
@@ -782,16 +791,15 @@ void attentionHost(const MatrixDesc<InputType> &Q,
   }
 
   // S:Int -> P:Int
-  S.rowSoftmax(P);
+  MatrixDesc<IntermediateType> _S = MatrixDesc<IntermediateType>(S.getDims().rows, S.getDims().cols);
+  S.rowSoftmax(_S);
 
   // P:Int -> _P:Inp
-  MatrixDesc<InputType> _P =
-      MatrixDesc<InputType>(P.getDims().rows, P.getDims().cols);
-  P.template copy<InputType>(_P);
+  _S.template copy<InputType>(P);
 
   // _P:Inp, V:Inp -> O:Acc
   MatrixDesc<AccumulatorType>::template multiply<InputType, AccumulatorType>(
-      _P, V, O);
+      P, V, O);
 }
 
 // Manages a memory buffer on the host and the device (optional).
@@ -1716,29 +1724,36 @@ public:
     uint32_t shmemReq = 0;
     uint32_t score = 0;
 
-    for (int i = 1; i < 8; i *= 2) {
-      for (int j = 1; j < 8; j *= 2) {
-        uint32_t tmpVr = i;
-        uint32_t tmpVc = 1;
-        uint32_t tmpUr = j;
-        uint32_t tmpUc = 1;
+    for (int i = 1; i <= 4; i *= 2) {
+      for (int j = 1; j <= 4; j *= 2) {
+        for(int k = 1; k <= 4; k *= 2){
+          uint32_t tmpVr = i;
+          uint32_t tmpVc = k;
+          uint32_t tmpUr = j;
+          uint32_t tmpUc = 1;
 
-        uint32_t tmpBr = tmpUr * tmpVr * MSize;
-        uint32_t tmpBc = tmpUc * tmpVc * NSize;
+          uint32_t tmpBr = tmpUr * tmpVr * MSize;
+          uint32_t tmpBc = tmpUc * tmpVc * NSize;
 
-        uint32_t tmpShmemReq = computeSharedMemoryNeeded(
-            tmpBr, tmpBc, d, elemSizeA, elemSizeS, elemSizeC);
+          uint32_t tmpShmemReq = computeSharedMemoryNeeded(
+              tmpBr, tmpBc, d, elemSizeA, elemSizeS, elemSizeC);
 
-        uint32_t tmpScore = tmpVr * tmpUr;
-        if ((tmpScore > score && tmpShmemReq < shmemSize && tmpBr <= s &&
-             tmpBc <= s) ||
-            (i == 1 && j == 1)) {
-          shmemReq = tmpShmemReq;
-          score = tmpScore;
-          Vr = tmpVr;
-          Vc = tmpVc;
-          Ur = tmpUr;
-          Uc = tmpUc;
+          // Prefers higher number of warptiles and higher number of coopmat 
+          // tiles in the columns of the warptiles
+          uint32_t tmpScore = tmpUr * tmpVr * tmpVc + tmpUr*2 + tmpVc;
+          if ((tmpScore > score && tmpShmemReq < shmemSize && tmpBr <= s &&
+              tmpBc <= s) ||
+              (i == 1 && j == 1 && k == 1)) {
+            shmemReq = tmpShmemReq;
+            score = tmpScore;
+
+            Vr = tmpVr;
+            Vc = tmpVc;
+            Ur = tmpUr;
+            Uc = tmpUc;
+
+            //std::cout << Vr << " " << Vc << " " << Ur << " " << Uc << std::endl;
+          }
         }
       }
     }
@@ -1986,7 +2001,7 @@ public:
   }
 
   void call(void *buffQ, void *buffKt, void *buffV, void *buffO,
-            void *buffS = nullptr, PerfParams *perfParams = nullptr,
+            void *buffS = nullptr, void* buffP=nullptr, PerfParams *perfParams = nullptr,
             std::ostream &log = std::cout) {
 
     log << "Device computation..." << std::endl << std::flush;
@@ -2014,7 +2029,7 @@ public:
     std::shared_ptr<DeviceMappedArray> S =
         std::make_shared<DeviceMappedArray>(context, elemSizeS * N * s);
     std::shared_ptr<DeviceMappedArray> P =
-        std::make_shared<DeviceMappedArray>(context, elemSizeS * N * s);
+        std::make_shared<DeviceMappedArray>(context, elemSizeA * N * s);
 #else
     std::shared_ptr<DeviceMappedArray> S = nullptr;
     std::shared_ptr<DeviceMappedArray> P = nullptr;
@@ -2038,7 +2053,7 @@ public:
 #endif
 
     std::vector<std::shared_ptr<DeviceMappedArray>> kernelParameters = {
-        Q, K, V, O, L, S, QT, KtT, ST};
+        Q, K, V, O, L, S, P, QT, KtT, ST};
 
     std::shared_ptr<DeviceMappedArray> paramArray =
         std::make_shared<DeviceMappedArray>(
@@ -2073,7 +2088,7 @@ public:
 
     // Copy matrices to host
     std::vector<std::shared_ptr<DeviceMappedArray>> outputArrays = {
-        O, L, S, QT, KtT, ST};
+        O, L, S, P, QT, KtT, ST};
     copyArrays(outputArrays, context->getDeviceToHostTransferCommandBuffer(),
                COPY_DEVICE_TO_HOST);
     executeCommands(context->getDeviceToHostTransferCommandBuffer());
@@ -2085,6 +2100,12 @@ public:
           std::make_shared<HostArray>(buffS, elemSizeS * N * s);
       arrS->copyDataFrom(*S);
     }
+
+    if (buffP != nullptr) {
+      std::shared_ptr<HostArray> arrP =
+          std::make_shared<HostArray>(buffP, elemSizeA * N * s);
+      arrP->copyDataFrom(*P);
+    }    
 #endif
   }
 
@@ -2108,6 +2129,8 @@ public:
         << std::endl;
     log << "* " << FMT_BEG << "1;32;4m"
         << "TFLOPS: " << tFlops << FMT_CLR << std::endl;
+  
+    std::cout << tFlops << std::endl;
   }
 
   ~FusedSDPA() {
@@ -2159,7 +2182,8 @@ void callAttention(void *buffQ, void *buffKt, void *buffV, void *buffO,
   }
 
   // PerfParams pp = {50, 0, 0};
-  attentionComputePipeline->call(buffQ, buffKt, buffV, buffO, nullptr,
+  attentionComputePipeline->call(buffQ, buffKt, buffV, buffO, 
+                                 nullptr, nullptr, // S, P
                                  nullptr, //&pp,
                                  log);
 }
@@ -2168,12 +2192,7 @@ void callAttention(void *buffQ, void *buffKt, void *buffV, void *buffO,
 template <typename InputType = std::float16_t,
           typename IntermediateType = std::float16_t,
           typename AccumulatorType = std::float16_t>
-void test(bool causalMasking = false, std::ostream &log = std::cout) {
-
-  uint32_t b = 4;
-  uint32_t h = 8;
-  uint32_t s = 2048;
-  uint32_t d = 64;
+void test(uint32_t b, uint32_t h, uint32_t s, uint32_t d, bool causalMasking = false, std::ostream &log = std::cout) {
   uint32_t N = b * h * s;
   uint32_t numElems = b * h * s * d;
 
@@ -2181,12 +2200,15 @@ void test(bool causalMasking = false, std::ostream &log = std::cout) {
   uint32_t elemSizeC = sizeof(AccumulatorType);
   uint32_t elemSizeS = sizeof(IntermediateType);
 
-  bool correctness = false;
+  bool correctness = true;
   IntermediateType scaling = IntermediateType(1.0);
 
   attentionComputePipeline = std::shared_ptr<FusedSDPA>(
       new FusedSDPA(c, numElems, {h * s * d, s * d, d, 1}, elemSizeA, elemSizeS,
                     elemSizeC, 1.0, causalMasking, log));
+
+  c -> checkCooperativeMatrixSupport(
+      16, 16, 16, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, log);
 
   log << "Testing performance... " << std::endl << std::flush;
 
@@ -2202,13 +2224,20 @@ void test(bool causalMasking = false, std::ostream &log = std::cout) {
       std::make_shared<DeviceMappedArray>(c, elemSizeC * N * d);
   std::shared_ptr<DeviceMappedArray> L =
       std::make_shared<DeviceMappedArray>(c, elemSizeC * N);
+#ifdef DEBUG_MODE
   std::shared_ptr<DeviceMappedArray> S =
       std::make_shared<DeviceMappedArray>(c, elemSizeS * N * s);
   std::shared_ptr<DeviceMappedArray> P =
       std::make_shared<DeviceMappedArray>(c, elemSizeS * N * s);
+  
+  MatrixDesc<IntermediateType> matS = MatrixDesc<IntermediateType>(N, s, S);
+  MatrixDesc<InputType> matP = MatrixDesc<InputType>(N, s, P);
+#else
+  std::shared_ptr<DeviceMappedArray> S = nullptr;
+  std::shared_ptr<DeviceMappedArray> P = nullptr;
+#endif
 
   MatrixDesc<AccumulatorType> matO = MatrixDesc<AccumulatorType>(N, d, O);
-  MatrixDesc<IntermediateType> matS = MatrixDesc<IntermediateType>(N, s, S);
 
   for (int headId = 0; headId < b * h; headId++) {
     MatrixDesc<InputType> matSliceQ =
@@ -2224,15 +2253,16 @@ void test(bool causalMasking = false, std::ostream &log = std::cout) {
 
     matSliceK.transpose_();
 
+#ifdef DEBUG_MODE
     if (correctness) {
       MatrixDesc<AccumulatorType> matSliceO = MatrixDesc<AccumulatorType>(
           s, d, O, headId * s * d * sizeof(AccumulatorType));
-      MatrixDesc<IntermediateType> matSliceS = MatrixDesc<IntermediateType>(
-          s, s, S, headId * s * s * sizeof(IntermediateType));
-      MatrixDesc<IntermediateType> matSliceP = MatrixDesc<IntermediateType>(
-          s, s, P, headId * s * s * sizeof(IntermediateType));
       MatrixDesc<AccumulatorType> matSliceL = MatrixDesc<AccumulatorType>(
           s, 1, L, headId * s * 1 * sizeof(AccumulatorType));
+      MatrixDesc<IntermediateType> matSliceS = MatrixDesc<IntermediateType>(
+          s, s, S, headId * s * s * sizeof(IntermediateType));
+      MatrixDesc<InputType> matSliceP = MatrixDesc<InputType>(
+          s, s, P, headId * s * s * sizeof(IntermediateType));
 
       if (causalMasking) {
         attentionHost<InputType, IntermediateType, AccumulatorType>(
@@ -2242,37 +2272,54 @@ void test(bool causalMasking = false, std::ostream &log = std::cout) {
         attentionHost<InputType, IntermediateType, AccumulatorType>(
             matSliceQ, matSliceK, matSliceV, matSliceS, matSliceO, matSliceP,
             causalMasking, scaling, log);
-        // flashAttentionHost(matSliceQ, matSliceK, matSliceV, matSliceO,
-        // matSliceL, matSliceS, 16, 16);
+        flashAttentionHost(matSliceQ, matSliceK, matSliceV, matSliceO, matSliceL, matSliceS, matSliceP, 16, 16, IntermediateType(1.0), false, true);
       }
     }
+#endif    
   }
 
-  MatrixDesc<IntermediateType> hostMatS = matS.copy();
+
   MatrixDesc<AccumulatorType> hostMatO = matO.copy();
 
-  attentionComputePipeline->call(Q->getPtr(), K->getPtr(), V->getPtr(),
-                                 O->getPtr(), S->getPtr(), &pp, log);
+#ifdef DEBUG_MODE
+  MatrixDesc<IntermediateType> hostMatS = matS.copy();
+  MatrixDesc<InputType> hostMatP = matP.copy();
+#endif
 
+  attentionComputePipeline->call(Q->getPtr(), K->getPtr(), V->getPtr(), O->getPtr(), 
+    S == nullptr ? nullptr : S->getPtr(), 
+    P == nullptr ? nullptr : P->getPtr(), 
+    &pp, log);
+
+#ifdef DEBUG_MODE
   if (correctness) {
     std::cout << "MSE (S): " << matS.mse(hostMatS) << std::endl;
-    hostMatS.printMatrix();
-    matS.printMatrix();
-
+    std::cout << "MSE (P): " << matP.mse(hostMatP) << std::endl;
     std::cout << "MSE (O): " << matO.mse(hostMatO) << std::endl;
   }
+#endif  
 }
 
 void runPerformanceTests() {
-  test<std::float16_t, std::float16_t, std::float16_t>();
-  test<std::float16_t, std::float16_t, float>();
-  test<std::float16_t, float, std::float16_t>();
-  test<std::float16_t, float, float>();
 
-  test<std::float16_t, std::float16_t, std::float16_t>(true);
-  test<std::float16_t, std::float16_t, float>(true);
-  test<std::float16_t, float, std::float16_t>(true);
-  test<std::float16_t, float, float>(true);
+  std::stringstream log;
+
+  bool causal = false;
+  
+  uint32_t b = 4;
+  uint32_t h = 8;
+  uint32_t sStart = 128;
+  uint32_t sStop = 16384;
+
+  uint32_t d;
+  for(uint32_t s = sStart; s <= sStop; s*=2){
+    d = 64;
+    std::cout << "#EXPERIMENT#" << "stfp16;ctfp16" << ";s" << s << ";d" << d << ";";
+    test<std::float16_t, std::float16_t, std::float16_t>(b, h, s, d, causal, log);
+    d = 128;
+    std::cout << "#EXPERIMENT#" << "stfp16;ctfp16" << ";s" << s << ";d" << d << ";";
+    test<std::float16_t, std::float16_t, std::float16_t>(b, h, s, d, causal, log);
+  }
 }
 
 int main(int argc, char *argv[]) {

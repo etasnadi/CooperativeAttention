@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2025 Ervin Tasnadi <etasnadi@protonmail.com>
+# SPDX-FileCopyrightText: Copyright (c) 2025 Ervin Tasnadi <etasnadi@protonmail.com>
 # SPDX-FileCopyrightText: Copyright (c) 2019-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
@@ -144,13 +144,15 @@ test_dims = [
     (1, 1, 64, 16),
     (2, 4, 256, 128),
     (4, 8, 2048, 64),
+    (4, 8, 4096, 64),
+    (4, 8, 8192, 64)
 ]
 
 test_precisions = [
     ("fp16", "fp16", "fp16"),
-    ("fp16", "fp16", "fp32"),
-    ("fp16", "fp32", "fp16"),
-    ("fp16", "fp32", "fp32"),
+    #("fp16", "fp16", "fp32"),
+    #("fp16", "fp32", "fp16"),
+    #("fp16", "fp32", "fp32"),
 ]
 
 repeats = 10
@@ -179,7 +181,7 @@ def test_call_attention():
         B, H, S, D = test_dim
 
         print(
-            f"* Setting dimensions to: batch={B}, head={H}, sequence length={S}, embed={D}"
+            f"\t * Setting dimensions to: batch={B}, head={H}, sequence length={S}, embed={D}"
         )
 
         for precision in test_precisions:
@@ -189,12 +191,12 @@ def test_call_attention():
             precision_acc = precision[2]
 
             print(
-                f'* Setting precision to: input="{precision_input}" intermediate="{precision_intermediate}" matrix accumulation="{precision_acc}"'
+                f'\t\t * Setting precision to: input="{precision_input}" intermediate="{precision_intermediate}" matrix accumulation="{precision_acc}"'
             )
 
             for causal in test_causal:
 
-                print(f"* Setting causal to: {causal}")
+                print(f"\t\t\t * Setting causal to: {causal}")
 
                 for r in range(repeats):
 
@@ -259,7 +261,7 @@ def test_call_attention():
                     mse = float(
                         torch.mean((vk_output.cpu() - t_output) ** 2).cpu().numpy()
                     )
-                    print(f"MSE: {mse}")
+                    print(f"\t\t\t\tMSE: {mse}")
 
 
 def main():

@@ -3,7 +3,7 @@ Memory efficient scaled dot product attention (SDPA) implementation using Vulkan
 
 This code is an independent implementation of the forward pass of the FlashAttention-2 algorithm. It uses cooperative matrices (VK_KHR_cooperative_matrix) to utilize Tensor Cores on NVIDIA hardware (or equivalent implementation on other GPUs) to accelerate matrix-matrix multiplications. It is intended to be an open-source, cross-gpu replacement of cuDNN's proprietary flash SDPA implementation. The algorithm (FlashAttention) is memory efficient, that means that it does not materialize the full softmax score matrix in the GPU memory to compute the attention output. For the details, consult the FlashAttention-2 paper [1].
 
-It currently supports float16 and float32 datatypes with mixed precision: input type is always float16 while intermediate computation and matrix  accumulation precision can be either float16 or float32 (and any combination of them).
+It currently supports float16 and float32 datatypes with mixed precision: input type is always float16 while intermediate computation and matrix  accumulation precision can be either float16 or float32 (and any combination of them). UPDATE: support for mixed precision is removed because it makes the kernel code too complicated.
 
 Python ctypes interface is also provided (src/frontend.py). Accuracy should be tested using the python interface as it directly compares the results to PyTorch's SDPA implementation (that can utilize the GPU). 
 
